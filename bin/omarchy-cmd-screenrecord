@@ -1,5 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
+# ----- Config / Directories -----
 [[ -f ~/.config/user-dirs.dirs ]] && source ~/.config/user-dirs.dirs
 OUTPUT_DIR="${OMARCHY_SCREENRECORD_DIR:-${XDG_VIDEOS_DIR:-$HOME/Videos}}"
 
@@ -8,48 +10,114 @@ if [[ ! -d "$OUTPUT_DIR" ]]; then
   exit 1
 fi
 
-# Selects region or output
-SCOPE="$1"
+# Scope: "output" => select monitor; anything else => select region
+SCOPE="${1:-}"
+# Audio: pass "audio" as 2nd argument to include system+mic (NV) or --audio (wl-screenrec)
+WITH_AUDIO="${2:-}"
 
-# Selects audio inclusion or not
-AUDIO=$([[ $2 == "audio" ]] && echo "--audio")
+# ----- Helpers -----
+notify() { notify-send "$1" -t "${2:-2000}"; }
+toggle_indicator() { pkill -RTMIN+8 waybar || true; }
 
-start_screenrecording() {
+is_nvidia() { lspci | grep -qi 'nvidia'; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+is_running() {
+  pgrep -f 'gpu-screen-recorder' >/dev/null || pgrep -f 'wl-screenrec' >/dev/null
+}
+
+stop_recording() {
+  pkill -f 'gpu-screen-recorder' || true
+  pkill -f 'wl-screenrec' || true
+  notify "Screen recording saved to $OUTPUT_DIR"
+  sleep 0.2
+  toggle_indicator
+}
+
+# slurp gives: "X,Y WIDTHxHEIGHT" (e.g., "21,354 949x718")
+# gpu-screen-recorder wants: -w region -region WxH+X+Y
+region_to_gsr() {
+  local region="$1"
+  local xy wh x y w h
+  xy="${region%% *}"
+  wh="${region##* }"
+  x="${xy%,*}"
+  y="${xy#*,}"
+  w="${wh%x*}"
+  h="${wh#*x}"
+  echo "-w region -region ${w}x${h}+${x}+${y}"
+}
+
+# Build audio args for gpu-screen-recorder (system + mic)
+gsr_audio_args() {
+  [[ "$WITH_AUDIO" != "audio" ]] && {
+    echo ""
+    return 0
+  }
+  local sink source
+  sink="$(pactl get-default-sink 2>/dev/null || true)"
+  source="$(pactl get-default-source 2>/dev/null || true)"
+  [[ -z "${sink:-}" || -z "${source:-}" ]] && {
+    echo ""
+    return 0
+  }
+  echo "-a ${sink}.monitor -a ${source}"
+}
+
+# Build audio args for wl-screenrec
+wl_audio_flag() {
+  [[ "$WITH_AUDIO" == "audio" ]] && echo "--audio" || echo ""
+}
+
+start_recording() {
   local filename="$OUTPUT_DIR/screenrecording-$(date +'%Y-%m-%d_%H-%M-%S').mp4"
 
-  if lspci | grep -qi 'nvidia'; then
-    wf-recorder $AUDIO -f "$filename" -c libx264 -p crf=23 -p preset=medium -p movflags=+faststart "$@" &
+  if is_nvidia && have gpu-screen-recorder; then
+    # ------- NVIDIA path: gpu-screen-recorder -------
+    local gsr_args="" audio_opts=""
+    audio_opts="$(gsr_audio_args)"
+
+    if [[ "$SCOPE" == "output" ]]; then
+      # slurp -o prints the output/monitor name (click the monitor)
+      local output
+      output="$(slurp -o)" || exit 1
+      gsr_args="-w \"$output\""
+    else
+      local region
+      region="$(slurp)" || exit 1
+      gsr_args="$(region_to_gsr "$region")"
+    fi
+
+    # Keep it simple/robust: 60 fps, quality mode; no invalid -x/-W flags, no -b.
+    # shellcheck disable=SC2086
+    eval gpu-screen-recorder $gsr_args \
+      -f 60 -q high $audio_opts \
+      -o "\"$filename\"" >/dev/null 2>&1 &
+
   else
-    wl-screenrec $AUDIO -f "$filename" --ffmpeg-encoder-options="-c:v libx264 -crf 23 -preset medium -movflags +faststart" "$@" &
+    # ------- Non-NVIDIA path: wl-screenrec -------
+    local geom audio_flag
+    audio_flag="$(wl_audio_flag)"
+
+    if [[ "$SCOPE" == "output" ]]; then
+      geom="$(slurp -o -f "%x,%y %wx%h")" || exit 1
+    else
+      geom="$(slurp -f "%x,%y %wx%h")" || exit 1
+    fi
+
+    # H.264 software encode; avoids your FFmpeg-8 pix_fmts issue in most cases.
+    wl-screenrec $audio_flag -g "$geom" -f "$filename" \
+      --ffmpeg-encoder-options "-c:v libx264 -crf 23 -preset medium -movflags +faststart" \
+      >/dev/null 2>&1 &
   fi
 
-  toggle_screenrecording_indicator
+  toggle_indicator
+  notify "Screen recording started"
 }
 
-stop_screenrecording() {
-  pkill -x wl-screenrec
-  pkill -x wf-recorder
-
-  notify-send "Screen recording saved to $OUTPUT_DIR" -t 2000
-
-  sleep 0.2 # ensures the process is actually dead before we check
-  toggle_screenrecording_indicator
-}
-
-toggle_screenrecording_indicator() {
-  pkill -RTMIN+8 waybar
-}
-
-screenrecording_active() {
-  pgrep -x wl-screenrec >/dev/null || pgrep -x wf-recorder >/dev/null
-}
-
-if screenrecording_active; then
-  stop_screenrecording
-elif [[ "$SCOPE" == "output" ]]; then
-  output=$(slurp -o) || exit 1
-  start_screenrecording -g "$output"
+# ----- Toggle behavior -----
+if is_running; then
+  stop_recording
 else
-  region=$(slurp) || exit 1
-  start_screenrecording -g "$region"
+  start_recording
 fi
